@@ -7,12 +7,12 @@ class MyTopo(Topo):
     """
     def build(self):
         # Add hosts
-        h1 = self.addHost('h1')
-        h2 = self.addHost('h2')
-        h3 = self.addHost('h3')
-        h4 = self.addHost('h4')
-        h5 = self.addHost('h5')
-        h6 = self.addHost('h6')
+        h1 = self.addHost('h1', ip='10.0.0.1/8', mac='00:00:00:00:00:01')
+        h2 = self.addHost('h2', ip='10.0.0.2/8', mac='00:00:00:00:00:02')
+        h3 = self.addHost('h3', ip='10.0.0.3/8', mac='00:00:00:00:00:03')
+        h4 = self.addHost('h4', ip='10.0.0.4/8', mac='00:00:00:00:00:04')
+        h5 = self.addHost('h5', ip='10.0.0.5/8', mac='00:00:00:00:00:05')
+        h6 = self.addHost('h6', ip='10.0.0.6/8', mac='00:00:00:00:00:06')
 
         # Add switches
         s1 = self.addSwitch('s1')
