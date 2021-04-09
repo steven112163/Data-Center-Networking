@@ -156,4 +156,9 @@ class SimpleMonitor13(SimpleSwitch13):
         for stat in sorted(body, key=attrgetter('port_no')):
             self.logger.info('%8x  %8d  %8d',
                              stat.port_no, stat.rx_bytes, stat.tx_bytes)
-        self.logger.info('****************************')
+        self.logger.info('')
+        self.logger.info('Mac Address Table    Port No')
+        self.logger.info('----------------------------')
+        for mac, port in self.mac_to_port[format(ev.msg.datapath.id, "d").zfill(16)].items():
+            self.logger.info('%s%11d', mac, port)
+        self.logger.info('****************************\n')
