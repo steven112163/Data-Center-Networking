@@ -3,7 +3,7 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
-from ryu.lib.packet import packet, ethernet, ether_types
+from ryu.lib.packet import packet, ethernet, ether_types, lldp
 import networkx as nx
 
 
@@ -102,6 +102,40 @@ class SimpleSwitch13(app_manager.RyuApp):
         for stat in body:
             if stat.port_no < of_proto.OFPP_MAX:
                 self.data_path_to_ports[data_path.id].append((stat.port_no, stat.hw_addr))
+
+    def lldp_sender(self):
+        """
+        Send LLDP every 5 seconds
+        :return: None
+        """
+        while True:
+            for data_path_id, data_path in self.data_paths.items():
+                if data_path_id in self.data_path_to_ports:
+                    port_no, hw_addr = self.data_path_to_ports[data_path_id]
+                    self.send_lldp(data_path, port_no, hw_addr)
+            hub.sleep(5)
+
+    @staticmethod
+    def send_lldp(data_path, port_no, hw_addr):
+        ofp = data_path.ofproto
+        pkt = packet.Packet()
+        pkt.add_protocol(
+            ethernet.ethernet(ethertype=ether_types.ETH_TYPE_LLDP, src=hw_addr, dst=lldp.LLDP_MAC_NEAREST_BRIDGE))
+
+        tlv_chassis_id = lldp.ChassisID(subtype=lldp.ChassisID.SUB_LOCALLY_ASSIGNED, chassis_id=str(data_path.id))
+        tlv_port_id = lldp.PortID(subtype=lldp.PortID.SUB_LOCALLY_ASSIGNED, port_id=str(port_no))
+        tlv_ttl = lldp.TTL(ttl=10)
+        tlv_end = lldp.End()
+        tlvs = (tlv_chassis_id, tlv_port_id, tlv_ttl, tlv_end)
+        pkt.add_protocol(lldp.lldp(tlvs))
+        pkt.serialize()
+
+        data = pkt.data
+        parser = data_path.ofproto_parser
+        actions = [parser.OFPActionOutput(port=port_no)]
+        out = parser.OFPPacketOut(datapath=data_path, buffer_id=ofp.OFP_NO_BUFFER, in_port=ofp.OFPP_CONTROLLER,
+                                  actions=actions, data=data)
+        data_path.send_msg(out)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
