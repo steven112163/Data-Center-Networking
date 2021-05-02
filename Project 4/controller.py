@@ -1,13 +1,10 @@
-from operator import attrgetter
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
-from ryu.controller.handler import set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import ether_types
+from ryu.lib.packet import packet, ethernet, ether_types
+import networkx as nx
 
 
 class SimpleSwitch13(app_manager.RyuApp):
@@ -16,6 +13,10 @@ class SimpleSwitch13(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
+        self.data_paths = {}
+        self.data_path_to_ports = {}
+        self.network = nx.DiGraph()
+        self.lldp_thread = hub.spawn(self.lldp_sender)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -35,6 +36,15 @@ class SimpleSwitch13(app_manager.RyuApp):
                                           of_proto.OFPCML_NO_BUFFER)]
         self.add_flow(data_path, 0, match, actions)
 
+        # Install LLDP flow entry
+        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_LLDP)
+        actions = [parser.OFPActionOutput(of_proto.OFPP_CONTROLLER,
+                                          of_proto.OFPCML_NO_BUFFER)]
+        self.add_flow(data_path, 0, match, actions)
+
+        # Request all ports' description
+        self.request_ports(data_path)
+
     def add_flow(self, data_path, priority, match, actions, buffer_id=None):
         of_proto = data_path.ofproto
         parser = data_path.ofproto_parser
@@ -49,6 +59,49 @@ class SimpleSwitch13(app_manager.RyuApp):
             mod = parser.OFPFlowMod(datapath=data_path, priority=priority,
                                     match=match, instructions=inst)
         data_path.send_msg(mod)
+
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def state_change_handler(self, ev):
+        data_path = ev.datapath
+        if ev.state == MAIN_DISPATCHER:
+            if data_path.id not in self.data_paths:
+                self.logger.debug('register data path: %016x', data_path.id)
+                self.data_paths[data_path.id] = data_path
+                self.data_path_to_ports[data_path.id] = []
+        elif ev.state == DEAD_DISPATCHER:
+            if data_path.id in self.data_paths:
+                self.logger.debug('unregister data path: %016x', data_path.id)
+                del self.data_paths[data_path.id]
+                del self.data_path_to_ports[data_path.id]
+
+    @staticmethod
+    def request_ports(data_path):
+        """
+        Send port description request to the switch
+        :param data_path: the target switch
+        :return: None
+        """
+        of_proto = data_path.ofproto
+        parser = data_path.ofproto_parser
+
+        req = parser.OFPPortDescStatsRequest(data_path, 0, of_proto.OFPP_ANY)
+        data_path.send_msg(req)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_desc_reply_handler(self, ev):
+        """
+        Collect all ports belong to the data path
+        :param ev: received event
+        :return: None
+        """
+        msg = ev.msg
+        body = msg.body
+        data_path = msg.datapath
+        of_proto = data_path.ofproto
+
+        for stat in body:
+            if stat.port_no < of_proto.OFPP_MAX:
+                self.data_path_to_ports[data_path.id].append((stat.port_no, stat.hw_addr))
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
