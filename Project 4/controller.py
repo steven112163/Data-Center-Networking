@@ -12,7 +12,6 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
         self.data_paths = {}
         self.data_path_to_ports = {}
         self.network = nx.DiGraph()
@@ -73,6 +72,10 @@ class SimpleSwitch13(app_manager.RyuApp):
                 self.logger.debug('unregister data path: %016x', data_path.id)
                 del self.data_paths[data_path.id]
                 del self.data_path_to_ports[data_path.id]
+                data_path_id = str(data_path.id)
+                if data_path_id in self.network:
+                    for neighbor in self.network.adj[data_path_id]:
+                        self.network.remove_edge(data_path_id, neighbor)
 
     @staticmethod
     def request_ports(data_path):
@@ -151,22 +154,35 @@ class SimpleSwitch13(app_manager.RyuApp):
         in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        eth = pkt.get_protocol(ethernet.ethernet)
+        if not eth:
+            return
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            # ignore lldp packet
-            return
+            lldp_pkt = pkt.get_protocol(lldp.lldp)
+            if lldp_pkt:
+                self.lldp_pkt_handler(data_path, in_port, lldp_pkt)
+        else:
+            self.normal_pkt_handler(data_path, msg, of_proto, parser, in_port, eth)
+
+    def normal_pkt_handler(self, data_path, msg, of_proto, parser, in_port, eth):
+        """
+        Normal packet handler
+        :return: None
+        """
         dst = eth.dst
         src = eth.src
+        data_path_id = str(data_path.id)
 
-        data_path_id = format(data_path.id, "d").zfill(16)
-        self.mac_to_port.setdefault(data_path_id, {})
+        if src not in self.network:
+            self.network.add_node(src)
+            self.network.add_edge(data_path_id, src, {'port': in_port})
+            self.network.add_edge(src, data_path_id)
 
-        # learn a mac address to avoid FLOOD next time.
-        self.mac_to_port[data_path_id][src] = in_port
-
-        if dst in self.mac_to_port[data_path_id]:
-            out_port = self.mac_to_port[data_path_id][dst]
+        if dst in self.network:
+            path = nx.shortest_path(self.network, src, dst)
+            next_hop = path[path.index(data_path_id) + 1]
+            out_port = self.network[data_path_id][next_hop]['port']
         else:
             out_port = of_proto.OFPP_FLOOD
 
@@ -189,3 +205,21 @@ class SimpleSwitch13(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=data_path, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         data_path.send_msg(out)
+
+    def lldp_pkt_handler(self, data_path, in_port, lldp_pkt):
+        """
+        LLDP packet handler
+        :return: None
+        """
+        sender_id = lldp_pkt.tlvs[0].chassis_id
+        sender_port = lldp_pkt.tlvs[1].port_id
+        receiver_id = str(data_path.id)
+        receiver_port = in_port
+
+        if sender_id not in self.network:
+            self.network.add_node(sender_id)
+        if receiver_id not in self.network:
+            self.network.add_node(receiver_id)
+
+        self.network.add_edge(sender_id, receiver_id, {'port': sender_port})
+        self.network.add_edge(receiver_id, sender_id, {'port': receiver_port})
