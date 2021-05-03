@@ -4,6 +4,7 @@ from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISP
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from ryu.lib.packet import packet, ethernet, ether_types, lldp
+from networkx import NetworkXNoPath
 import networkx as nx
 
 
@@ -74,8 +75,7 @@ class SimpleSwitch13(app_manager.RyuApp):
                 del self.data_path_to_ports[data_path.id]
                 data_path_id = str(data_path.id)
                 if data_path_id in self.network:
-                    for neighbor in self.network.adj[data_path_id]:
-                        self.network.remove_edge(data_path_id, neighbor)
+                    self.network.remove_node(data_path_id)
 
     @staticmethod
     def request_ports(data_path):
@@ -114,8 +114,9 @@ class SimpleSwitch13(app_manager.RyuApp):
         while True:
             for data_path_id, data_path in self.data_paths.items():
                 if data_path_id in self.data_path_to_ports:
-                    port_no, hw_addr = self.data_path_to_ports[data_path_id]
-                    self.send_lldp(data_path, port_no, hw_addr)
+                    list_of_ports = self.data_path_to_ports[data_path_id]
+                    for port_no, hw_addr in list_of_ports:
+                        self.send_lldp(data_path, port_no, hw_addr)
             hub.sleep(5)
 
     @staticmethod
@@ -176,13 +177,16 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         if src not in self.network:
             self.network.add_node(src)
-            self.network.add_edge(data_path_id, src, {'port': in_port})
+            self.network.add_edge(data_path_id, src, port=in_port)
             self.network.add_edge(src, data_path_id)
 
         if dst in self.network:
-            path = nx.shortest_path(self.network, src, dst)
-            next_hop = path[path.index(data_path_id) + 1]
-            out_port = self.network[data_path_id][next_hop]['port']
+            try:
+                path = nx.shortest_path(self.network, src, dst)
+                next_hop = path[path.index(data_path_id) + 1]
+                out_port = self.network[data_path_id][next_hop]['port']
+            except NetworkXNoPath:
+                out_port = of_proto.OFPP_FLOOD
         else:
             out_port = of_proto.OFPP_FLOOD
 
@@ -221,5 +225,5 @@ class SimpleSwitch13(app_manager.RyuApp):
         if receiver_id not in self.network:
             self.network.add_node(receiver_id)
 
-        self.network.add_edge(sender_id, receiver_id, {'port': sender_port})
-        self.network.add_edge(receiver_id, sender_id, {'port': receiver_port})
+        self.network.add_edge(sender_id, receiver_id, port=sender_port)
+        self.network.add_edge(receiver_id, sender_id, port=receiver_port)
