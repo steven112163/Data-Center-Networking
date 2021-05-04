@@ -19,8 +19,11 @@ class SimpleSwitch13(app_manager.RyuApp):
         self.network = nx.DiGraph()
         self.lldp_thread = hub.spawn(self.lldp_sender)
         self.mac_to_group = {}
+        self.groups = {}
+        self.mac_to_leaf = {}
         with open('./utils/config.json') as f:
             configuration = json.load(f)
+            self.groups = configuration['groups']
             for key, macs in configuration['groups'].items():
                 for mac in macs:
                     self.mac_to_group[mac] = key
@@ -44,13 +47,9 @@ class SimpleSwitch13(app_manager.RyuApp):
                                           of_proto.OFPCML_NO_BUFFER)]
         self.add_flow(data_path, 0, match, actions)
 
-        # Install LLDP flow entry
-        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_LLDP)
-        actions = [parser.OFPActionOutput(of_proto.OFPP_CONTROLLER,
-                                          of_proto.OFPCML_NO_BUFFER)]
-        self.add_flow(data_path, 0, match, actions)
-
-        # Request all ports' description
+        self.data_paths[data_path.id] = data_path
+        self.data_path_to_ports[data_path.id] = []
+        self.logger.info(list(self.network))
         self.request_ports(data_path)
 
     def add_flow(self, data_path, priority, match, actions, buffer_id=None):
@@ -68,23 +67,6 @@ class SimpleSwitch13(app_manager.RyuApp):
                                     match=match, instructions=inst)
         data_path.send_msg(mod)
 
-    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
-    def state_change_handler(self, ev):
-        data_path = ev.datapath
-        if ev.state == MAIN_DISPATCHER:
-            if data_path.id not in self.data_paths:
-                self.logger.debug('register data path: %016x', data_path.id)
-                self.data_paths[data_path.id] = data_path
-                self.data_path_to_ports[data_path.id] = []
-        elif ev.state == DEAD_DISPATCHER:
-            if data_path.id in self.data_paths:
-                self.logger.debug('unregister data path: %016x', data_path.id)
-                del self.data_paths[data_path.id]
-                del self.data_path_to_ports[data_path.id]
-                data_path_id = str(data_path.id)
-                if data_path_id in self.network:
-                    self.network.remove_node(data_path_id)
-
     @staticmethod
     def request_ports(data_path):
         """
@@ -92,13 +74,12 @@ class SimpleSwitch13(app_manager.RyuApp):
         :param data_path: the target switch
         :return: None
         """
-        of_proto = data_path.ofproto
         parser = data_path.ofproto_parser
 
-        req = parser.OFPPortDescStatsRequest(data_path, 0, of_proto.OFPP_ANY)
+        req = parser.OFPPortDescStatsRequest(data_path, 0)
         data_path.send_msg(req)
 
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_reply_handler(self, ev):
         """
         Collect all ports belong to the data path
@@ -112,7 +93,8 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         for stat in body:
             if stat.port_no < of_proto.OFPP_MAX:
-                self.data_path_to_ports[data_path.id].append((stat.port_no, stat.hw_addr))
+                self.data_path_to_ports[data_path.id].append({'port_no': stat.port_no,
+                                                              'hw_addr': stat.hw_addr})
 
     def lldp_sender(self):
         """
@@ -122,9 +104,8 @@ class SimpleSwitch13(app_manager.RyuApp):
         while True:
             for data_path_id, data_path in self.data_paths.items():
                 if data_path_id in self.data_path_to_ports:
-                    list_of_ports = self.data_path_to_ports[data_path_id]
-                    for port_no, hw_addr in list_of_ports:
-                        self.send_lldp(data_path, port_no, hw_addr)
+                    for port in self.data_path_to_ports[data_path_id]:
+                        self.send_lldp(data_path, port['port_no'], port['hw_addr'])
             hub.sleep(5)
 
     @staticmethod
@@ -183,7 +164,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         src = eth.src
         data_path_id = str(data_path.id)
 
-        if src not in self.network:
+        if src not in self.network and src in self.mac_to_group:
             self.network.add_node(src)
             self.network.add_edge(data_path_id, src, port=in_port)
             self.network.add_edge(src, data_path_id)
@@ -193,35 +174,37 @@ class SimpleSwitch13(app_manager.RyuApp):
                 # Src and Dst belong to different groups
                 return
 
+        output_ports = []
         if dst in self.network:
             try:
                 path = nx.shortest_path(self.network, src, dst)
                 next_hop = path[path.index(data_path_id) + 1]
-                out_port = self.network[data_path_id][next_hop]['port']
+                output_ports.append(self.network[data_path_id][next_hop]['port'])
             except NetworkXNoPath:
-                out_port = of_proto.OFPP_FLOOD
+                output_ports.append(of_proto.OFPP_FLOOD)
         else:
-            out_port = of_proto.OFPP_FLOOD
+            output_ports.append(of_proto.OFPP_FLOOD)
 
-        actions = [parser.OFPActionOutput(out_port)]
+        for out_port in output_ports:
+            actions = [parser.OFPActionOutput(out_port)]
 
-        # install a flow to avoid packet_in next time
-        if out_port != of_proto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            # verify if we have a valid buffer_id, if yes avoid to send both
-            # flow_mod & packet_out
-            if msg.buffer_id != of_proto.OFP_NO_BUFFER:
-                self.add_flow(data_path, 1, match, actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow(data_path, 1, match, actions)
-        data = None
-        if msg.buffer_id == of_proto.OFP_NO_BUFFER:
-            data = msg.data
+            # install a flow to avoid packet_in next time
+            if out_port != of_proto.OFPP_FLOOD:
+                match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+                # verify if we have a valid buffer_id, if yes avoid to send both
+                # flow_mod & packet_out
+                if msg.buffer_id != of_proto.OFP_NO_BUFFER:
+                    self.add_flow(data_path, 1, match, actions, msg.buffer_id)
+                    return
+                else:
+                    self.add_flow(data_path, 1, match, actions)
+            data = None
+            if msg.buffer_id == of_proto.OFP_NO_BUFFER:
+                data = msg.data
 
-        out = parser.OFPPacketOut(datapath=data_path, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
-        data_path.send_msg(out)
+            out = parser.OFPPacketOut(datapath=data_path, buffer_id=msg.buffer_id,
+                                      in_port=in_port, actions=actions, data=data)
+            data_path.send_msg(out)
 
     def lldp_pkt_handler(self, data_path, in_port, lldp_pkt):
         """
