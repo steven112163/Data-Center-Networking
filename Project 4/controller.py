@@ -49,7 +49,6 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         self.data_paths[data_path.id] = data_path
         self.data_path_to_ports[data_path.id] = []
-        self.logger.info(list(self.network))
         self.request_ports(data_path)
 
     def add_flow(self, data_path, priority, match, actions, buffer_id=None):
@@ -145,8 +144,6 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
-        if not eth:
-            return
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             lldp_pkt = pkt.get_protocol(lldp.lldp)
@@ -166,7 +163,7 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         if src not in self.network and src in self.mac_to_group:
             self.network.add_node(src)
-            self.network.add_edge(data_path_id, src, port=in_port)
+            self.network.add_edge(data_path_id, src, port=int(in_port))
             self.network.add_edge(src, data_path_id)
 
         if src in self.mac_to_group and dst in self.mac_to_group:
@@ -174,47 +171,44 @@ class SimpleSwitch13(app_manager.RyuApp):
                 # Src and Dst belong to different groups
                 return
 
-        output_ports = []
+        out_port = of_proto.OFPP_FLOOD
         if dst in self.network:
             try:
                 path = nx.shortest_path(self.network, src, dst)
                 next_hop = path[path.index(data_path_id) + 1]
-                output_ports.append(self.network[data_path_id][next_hop]['port'])
+                out_port = self.network[data_path_id][next_hop]['port']
             except NetworkXNoPath:
-                output_ports.append(of_proto.OFPP_FLOOD)
-        else:
-            output_ports.append(of_proto.OFPP_FLOOD)
+                self.logger.info(list(self.network.edges))
 
-        for out_port in output_ports:
-            actions = [parser.OFPActionOutput(out_port)]
+        actions = [parser.OFPActionOutput(out_port)]
 
-            # install a flow to avoid packet_in next time
-            if out_port != of_proto.OFPP_FLOOD:
-                match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-                # verify if we have a valid buffer_id, if yes avoid to send both
-                # flow_mod & packet_out
-                if msg.buffer_id != of_proto.OFP_NO_BUFFER:
-                    self.add_flow(data_path, 1, match, actions, msg.buffer_id)
-                    return
-                else:
-                    self.add_flow(data_path, 1, match, actions)
-            data = None
-            if msg.buffer_id == of_proto.OFP_NO_BUFFER:
-                data = msg.data
+        # install a flow to avoid packet_in next time
+        if out_port != of_proto.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+            # verify if we have a valid buffer_id, if yes avoid to send both
+            # flow_mod & packet_out
+            if msg.buffer_id != of_proto.OFP_NO_BUFFER:
+                self.add_flow(data_path, 1, match, actions, msg.buffer_id)
+                return
+            else:
+                self.add_flow(data_path, 1, match, actions)
+        data = None
+        if msg.buffer_id == of_proto.OFP_NO_BUFFER:
+            data = msg.data
 
-            out = parser.OFPPacketOut(datapath=data_path, buffer_id=msg.buffer_id,
-                                      in_port=in_port, actions=actions, data=data)
-            data_path.send_msg(out)
+        out = parser.OFPPacketOut(datapath=data_path, buffer_id=msg.buffer_id,
+                                  in_port=in_port, actions=actions, data=data)
+        data_path.send_msg(out)
 
     def lldp_pkt_handler(self, data_path, in_port, lldp_pkt):
         """
         LLDP packet handler
         :return: None
         """
-        sender_id = lldp_pkt.tlvs[0].chassis_id
-        sender_port = lldp_pkt.tlvs[1].port_id
+        sender_id = str(lldp_pkt.tlvs[0].chassis_id)
+        sender_port = int(lldp_pkt.tlvs[1].port_id)
         receiver_id = str(data_path.id)
-        receiver_port = in_port
+        receiver_port = int(in_port)
 
         if sender_id not in self.network:
             self.network.add_node(sender_id)
