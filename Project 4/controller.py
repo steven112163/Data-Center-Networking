@@ -1,10 +1,9 @@
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from ryu.lib.packet import packet, ethernet, ether_types, lldp
-from networkx import NetworkXNoPath
 import networkx as nx
 import json
 
@@ -16,11 +15,13 @@ class SimpleSwitch13(app_manager.RyuApp):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
         self.data_paths = {}
         self.data_path_to_ports = {}
+        self.mac_to_port = {}
         self.network = nx.DiGraph()
         self.lldp_thread = hub.spawn(self.lldp_sender)
         self.mac_to_group = {}
         self.groups = {}
         self.mac_to_leaf = {}
+        self.leaf_to_macs = {}
         with open('./utils/config.json') as f:
             configuration = json.load(f)
             self.groups = configuration['groups']
@@ -28,6 +29,11 @@ class SimpleSwitch13(app_manager.RyuApp):
                 for mac in macs:
                     self.mac_to_group[mac] = key
             self.mac_to_leaf = configuration['links']
+            for mac, switch in configuration['links'].items():
+                if switch['switch_id'] in self.leaf_to_macs:
+                    self.leaf_to_macs[switch['switch_id']][switch['port']] = mac
+                else:
+                    self.leaf_to_macs[switch['switch_id']] = {switch['port']: mac}
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -47,8 +53,8 @@ class SimpleSwitch13(app_manager.RyuApp):
                                           of_proto.OFPCML_NO_BUFFER)]
         self.add_flow(data_path, 0, match, actions)
 
-        self.data_paths[data_path.id] = data_path
-        self.data_path_to_ports[data_path.id] = []
+        self.data_paths[str(data_path.id)] = data_path
+        self.data_path_to_ports[str(data_path.id)] = []
         self.request_ports(data_path)
 
     def add_flow(self, data_path, priority, match, actions, buffer_id=None):
@@ -88,11 +94,12 @@ class SimpleSwitch13(app_manager.RyuApp):
         msg = ev.msg
         body = msg.body
         data_path = msg.datapath
+        data_path_id = str(data_path.id)
         of_proto = data_path.ofproto
 
         for stat in body:
             if stat.port_no < of_proto.OFPP_MAX:
-                self.data_path_to_ports[data_path.id].append({'port_no': stat.port_no,
+                self.data_path_to_ports[data_path_id].append({'port_no': int(stat.port_no),
                                                               'hw_addr': stat.hw_addr})
 
     def lldp_sender(self):
@@ -166,24 +173,57 @@ class SimpleSwitch13(app_manager.RyuApp):
             self.network.add_edge(data_path_id, src, port=int(in_port))
             self.network.add_edge(src, data_path_id)
 
+        output_ports = []
         if src in self.mac_to_group and dst in self.mac_to_group:
             if self.mac_to_group[src] != self.mac_to_group[dst]:
                 # Src and Dst belong to different groups
                 return
-
-        out_port = of_proto.OFPP_FLOOD
-        if dst in self.network:
             try:
+                # Find shortest path
                 path = nx.shortest_path(self.network, src, dst)
                 next_hop = path[path.index(data_path_id) + 1]
-                out_port = self.network[data_path_id][next_hop]['port']
-            except NetworkXNoPath:
-                self.logger.info(list(self.network.edges))
+                output_ports.append(self.network[data_path_id][next_hop]['port'])
+            except:
+                # There is no path
+                # Shouldn't reach here
+                self.logger.info('Warning: Cannot find dst!!! Flood the frame')
+                output_ports.append(of_proto.OFPP_FLOOD)
+        elif src in self.mac_to_group:
+            # Unknown/broadcast destination
+            if dst == 'ff:ff:ff:ff:ff:ff':
+                for port in self.data_path_to_ports[data_path_id]:
+                    if port['port_no'] == int(in_port):
+                        # Do not send frame to ingress port
+                        continue
+                    if data_path_id in self.leaf_to_macs:
+                        if port['port_no'] not in self.leaf_to_macs[data_path_id]:
+                            output_ports.append(port['port_no'])
+                        elif self.mac_to_group[self.leaf_to_macs[data_path_id][port['port_no']]] \
+                                == self.mac_to_group[src]:
+                            output_ports.append(port['port_no'])
+                    else:
+                        output_ports.append(port['port_no'])
+            else:
+                # Unknown destination
+                # Background traffic
+                output_ports.append(of_proto.OFPP_FLOOD)
+        else:
+            # Background traffic
+            self.mac_to_port.setdefault(data_path_id, {})
+            self.mac_to_port[data_path_id][src] = int(in_port)
+            if dst in self.mac_to_port[data_path_id]:
+                output_ports.append(self.mac_to_port[data_path_id][dst])
+            else:
+                output_ports.append(of_proto.OFPP_FLOOD)
 
-        actions = [parser.OFPActionOutput(out_port)]
+        if len(output_ports) == 0:
+            # Should not forward the frame
+            return
+
+        actions = [parser.OFPActionOutput(out_port) for out_port in output_ports]
 
         # install a flow to avoid packet_in next time
-        if out_port != of_proto.OFPP_FLOOD:
+        if output_ports[0] != of_proto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
             # verify if we have a valid buffer_id, if yes avoid to send both
             # flow_mod & packet_out
