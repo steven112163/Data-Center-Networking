@@ -9,3 +9,5 @@ network.
 |---|---|
 |`make`|Run the network|
 |`make clean`|Clean the mininet|
+|`make server`|Start UDP server|
+|`make client`|Start UDP client|
