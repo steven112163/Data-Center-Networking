@@ -13,21 +13,42 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
+
+        # data path ID -> data path
         self.data_paths = {}
+
+        # data path ID -> list of available ports
         self.data_path_to_ports = {}
+
+        # Learning bridge for background traffic
         self.mac_to_port = {}
-        self.network = nx.DiGraph()
-        self.lldp_thread = hub.spawn(self.lldp_sender)
-        self.mac_to_group = {}
+
+        # Tenancy
+        # group ID -> MAC addresses
         self.groups = {}
+        # MAC address -> belonged group
+        self.mac_to_group = {}
+
+        # Leaf and host connection
+        # MAC address -> connected leaf ID and port
         self.mac_to_leaf = {}
+        # Leaf ID -> port number -> MAC address
         self.leaf_to_macs = {}
+
+        # Graph of the network
+        self.network = nx.DiGraph()
+
+        # LLDP sender
+        self.lldp_thread = hub.spawn(self.lldp_sender)
+
         with open('./utils/config.json') as f:
             configuration = json.load(f)
+
             self.groups = configuration['groups']
             for key, macs in configuration['groups'].items():
                 for mac in macs:
                     self.mac_to_group[mac] = key
+
             self.mac_to_leaf = configuration['links']
             for mac, switch in configuration['links'].items():
                 if switch['switch_id'] in self.leaf_to_macs:
@@ -37,7 +58,13 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
+        """
+        Handle initial installation after handshake between switch and controller
+        :param ev: received event
+        :return: None
+        """
         data_path = ev.msg.datapath
+        data_path_id = str(data_path.id)
         of_proto = data_path.ofproto
         parser = data_path.ofproto_parser
 
@@ -53,11 +80,21 @@ class SimpleSwitch13(app_manager.RyuApp):
                                           of_proto.OFPCML_NO_BUFFER)]
         self.add_flow(data_path, 0, match, actions)
 
-        self.data_paths[str(data_path.id)] = data_path
-        self.data_path_to_ports[str(data_path.id)] = []
+        self.data_paths[data_path_id] = data_path
+        self.data_path_to_ports[data_path_id] = []
         self.request_ports(data_path)
 
-    def add_flow(self, data_path, priority, match, actions, buffer_id=None):
+    @staticmethod
+    def add_flow(data_path, priority, match, actions, buffer_id=None):
+        """
+        Add flow entry to the target switch
+        :param data_path: target switch
+        :param priority: priority of the flow entry
+        :param match: match requirement
+        :param actions: applied actions
+        :param buffer_id: buffer ID of the frame
+        :return: None
+        """
         of_proto = data_path.ofproto
         parser = data_path.ofproto_parser
 
@@ -98,9 +135,11 @@ class SimpleSwitch13(app_manager.RyuApp):
         of_proto = data_path.ofproto
 
         for stat in body:
+            port_no = int(stat.port_no)
+            hw_addr = str(stat.hw_addr)
             if stat.port_no < of_proto.OFPP_MAX:
-                self.data_path_to_ports[data_path_id].append({'port_no': int(stat.port_no),
-                                                              'hw_addr': stat.hw_addr})
+                self.data_path_to_ports[data_path_id].append({'port_no': port_no,
+                                                              'hw_addr': hw_addr})
 
     def lldp_sender(self):
         """
@@ -116,6 +155,13 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     @staticmethod
     def send_lldp(data_path, port_no, hw_addr):
+        """
+        Send LLDP frame from the port on target data path
+        :param data_path: target data path
+        :param port_no: target port number
+        :param hw_addr: hardware address of the target port
+        :return: None
+        """
         ofp = data_path.ofproto
         pkt = packet.Packet()
         pkt.add_protocol(
@@ -138,6 +184,11 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
+        """
+        Packet-in handler
+        :param ev: received event
+        :return: None
+        """
         # If you hit this you might want to increase
         # the "miss_send_length" of your switch
         if ev.msg.msg_len < ev.msg.total_len:
@@ -147,7 +198,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         data_path = msg.datapath
         of_proto = data_path.ofproto
         parser = data_path.ofproto_parser
-        in_port = msg.match['in_port']
+        in_port = int(msg.match['in_port'])
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
@@ -159,9 +210,36 @@ class SimpleSwitch13(app_manager.RyuApp):
         else:
             self.normal_pkt_handler(data_path, msg, of_proto, parser, in_port, eth)
 
+    def lldp_pkt_handler(self, data_path, in_port, lldp_pkt):
+        """
+        LLDP packet handler
+        :param data_path: switch that sent the packet-in
+        :param in_port: port which received the frame
+        :param lldp_pkt: LLDP frame
+        :return: None
+        """
+        sender_id = str(lldp_pkt.tlvs[0].chassis_id)
+        sender_port = int(lldp_pkt.tlvs[1].port_id)
+        receiver_id = str(data_path.id)
+        receiver_port = int(in_port)
+
+        if sender_id not in self.network:
+            self.network.add_node(sender_id)
+        if receiver_id not in self.network:
+            self.network.add_node(receiver_id)
+
+        self.network.add_edge(sender_id, receiver_id, port=sender_port)
+        self.network.add_edge(receiver_id, sender_id, port=receiver_port)
+
     def normal_pkt_handler(self, data_path, msg, of_proto, parser, in_port, eth):
         """
         Normal packet handler
+        :param data_path: switch that sent the packet-in
+        :param msg: message in the received event
+        :param of_proto: OpenFlow protocol used on the data path
+        :param parser: OpenFlow parser
+        :param in_port: port which received the frame
+        :param eth: Ethernet frame
         :return: None
         """
         dst = eth.dst
@@ -169,8 +247,10 @@ class SimpleSwitch13(app_manager.RyuApp):
         data_path_id = str(data_path.id)
 
         if src not in self.network and src in self.mac_to_group:
+            # If src is not in the network graph and it is host that needs to be
+            # handled, then add it into the network graph.
             self.network.add_node(src)
-            self.network.add_edge(data_path_id, src, port=int(in_port))
+            self.network.add_edge(data_path_id, src, port=in_port)
             self.network.add_edge(src, data_path_id)
 
         output_ports = []
@@ -178,43 +258,24 @@ class SimpleSwitch13(app_manager.RyuApp):
             if self.mac_to_group[src] != self.mac_to_group[dst]:
                 # Src and Dst belong to different groups
                 return
-            try:
-                # Find shortest path
-                path = nx.shortest_path(self.network, src, dst)
-                next_hop = path[path.index(data_path_id) + 1]
-                output_ports.append(self.network[data_path_id][next_hop]['port'])
-            except:
-                # There is no path
-                # Shouldn't reach here
-                self.logger.info('Warning: Cannot find dst!!! Flood the frame')
-                output_ports.append(of_proto.OFPP_FLOOD)
+            output_ports += self.find_shortest_path(src=src,
+                                                    dst=dst,
+                                                    data_path_id=data_path_id,
+                                                    of_proto=of_proto)
         elif src in self.mac_to_group:
             # Unknown/broadcast destination
-            if dst == 'ff:ff:ff:ff:ff:ff':
-                for port in self.data_path_to_ports[data_path_id]:
-                    if port['port_no'] == int(in_port):
-                        # Do not send frame to ingress port
-                        continue
-                    if data_path_id in self.leaf_to_macs:
-                        if port['port_no'] not in self.leaf_to_macs[data_path_id]:
-                            output_ports.append(port['port_no'])
-                        elif self.mac_to_group[self.leaf_to_macs[data_path_id][port['port_no']]] \
-                                == self.mac_to_group[src]:
-                            output_ports.append(port['port_no'])
-                    else:
-                        output_ports.append(port['port_no'])
-            else:
-                # Unknown destination
-                # Background traffic
-                output_ports.append(of_proto.OFPP_FLOOD)
+            output_ports += self.find_suitable_ports(src=src,
+                                                     dst=dst,
+                                                     data_path_id=data_path_id,
+                                                     in_port=in_port,
+                                                     of_proto=of_proto)
         else:
             # Background traffic
-            self.mac_to_port.setdefault(data_path_id, {})
-            self.mac_to_port[data_path_id][src] = int(in_port)
-            if dst in self.mac_to_port[data_path_id]:
-                output_ports.append(self.mac_to_port[data_path_id][dst])
-            else:
-                output_ports.append(of_proto.OFPP_FLOOD)
+            output_ports += self.handle_background_traffic(src=src,
+                                                           dst=dst,
+                                                           data_path_id=data_path_id,
+                                                           in_port=in_port,
+                                                           of_proto=of_proto)
 
         if len(output_ports) == 0:
             # Should not forward the frame
@@ -240,20 +301,98 @@ class SimpleSwitch13(app_manager.RyuApp):
                                   in_port=in_port, actions=actions, data=data)
         data_path.send_msg(out)
 
-    def lldp_pkt_handler(self, data_path, in_port, lldp_pkt):
+    def find_shortest_path(self, src, dst, data_path_id, of_proto):
         """
-        LLDP packet handler
-        :return: None
+        Find shortest path to the destination
+        :param src: source MAC address
+        :param dst: destination MAC address
+        :param data_path_id: switch ID
+        :param of_proto: OpenFlow protocol used on the data path
+        :return: ports
         """
-        sender_id = str(lldp_pkt.tlvs[0].chassis_id)
-        sender_port = int(lldp_pkt.tlvs[1].port_id)
-        receiver_id = str(data_path.id)
-        receiver_port = int(in_port)
+        ports = []
+        try:
+            # Find shortest path
+            path = nx.shortest_path(self.network, src, dst)
+            next_hop = path[path.index(data_path_id) + 1]
+            ports.append(self.network[data_path_id][next_hop]['port'])
+        except:
+            # Try to reach the leaf
+            self.logger.info('Warning: Cannot find dst!!! Try to reach the leaf')
+            last_data_path_id = self.mac_to_leaf[dst]['switch_id']
+            if data_path_id == last_data_path_id:
+                # Last hop
+                self.network.add_node(dst)
+                self.network.add_edge(data_path_id, dst, port=self.mac_to_leaf[dst]['port'])
+                self.network.add_edge(dst, data_path_id)
+                ports.append(self.mac_to_leaf[dst]['port'])
+            else:
+                # Find shortest path to leaf
+                try:
+                    path = nx.shortest_path(self.network, src, last_data_path_id)
+                    next_hop = path[path.index(data_path_id) + 1]
+                    ports.append(self.network[data_path_id][next_hop]['port'])
+                except:
+                    # There is no path
+                    # Shouldn't reach here
+                    self.logger.info('Warning: Cannot find leaf!!! Flood the frame')
+                    ports.append(of_proto.OFPP_FLOOD)
 
-        if sender_id not in self.network:
-            self.network.add_node(sender_id)
-        if receiver_id not in self.network:
-            self.network.add_node(receiver_id)
+        return ports
 
-        self.network.add_edge(sender_id, receiver_id, port=sender_port)
-        self.network.add_edge(receiver_id, sender_id, port=receiver_port)
+    def find_suitable_ports(self, src, dst, data_path_id, in_port, of_proto):
+        """
+        Find suitable ports that do not belong
+        :param src: source MAC address
+        :param dst: destination MAC address
+        :param data_path_id: target data path ID
+        :param in_port: port which received the frame
+        :param of_proto: OpenFLow protocol used on the data path
+        :return: ports
+        """
+        # Unknown/broadcast destination
+        ports = []
+        if dst == 'ff:ff:ff:ff:ff:ff':
+            # Broadcast
+            for port in self.data_path_to_ports[data_path_id]:
+                if port['port_no'] == in_port:
+                    # Do not send frame to ingress port
+                    continue
+                if data_path_id in self.leaf_to_macs:
+                    if port['port_no'] not in self.leaf_to_macs[data_path_id]:
+                        ports.append(port['port_no'])
+                    elif self.mac_to_group[self.leaf_to_macs[data_path_id][port['port_no']]] \
+                            == self.mac_to_group[src]:
+                        ports.append(port['port_no'])
+                else:
+                    ports.append(port['port_no'])
+        else:
+            # Unknown destination
+            ports += self.handle_background_traffic(src=src,
+                                                    dst=dst,
+                                                    data_path_id=data_path_id,
+                                                    in_port=in_port,
+                                                    of_proto=of_proto)
+
+        return ports
+
+    def handle_background_traffic(self, src, dst, data_path_id, in_port, of_proto):
+        """
+        Handle background traffic
+        :param src: source MAC address
+        :param dst: destination MAC address
+        :param data_path_id: target data path ID
+        :param in_port: port which received the frame
+        :param of_proto: OpenFLow protocol used on the data path
+        :return: ports
+        """
+        # Background traffic
+        ports = []
+        self.mac_to_port.setdefault(data_path_id, {})
+        self.mac_to_port[data_path_id][src] = in_port
+        if dst in self.mac_to_port[data_path_id]:
+            ports.append(self.mac_to_port[data_path_id][dst])
+        else:
+            ports.append(of_proto.OFPP_FLOOD)
+
+        return ports
